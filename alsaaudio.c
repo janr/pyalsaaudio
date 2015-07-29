@@ -899,6 +899,7 @@ alsapcm_polldescriptors(alsapcm_t *self, PyObject *args)
     {
         PyErr_Format(PyExc_MemoryError, "Out of memory [%s]",
                      self->cardname);
+        free(fds);
         return NULL;
     }
 
@@ -928,6 +929,43 @@ PyDoc_STRVAR(pcm_polldescriptors_doc,
 Return a list of file descriptors and event masks\n\
 suitable for use with poll.");
 
+static PyObject *
+alsapcm_poll_revents(alsapcm_t *self, PyObject *args)
+{
+    int i_arg = 0, status_code;
+    unsigned short revents;
+    struct pollfd pfd;
+
+    if (!PyArg_ParseTuple(args, "i:poll_events", &i_arg))
+        return NULL;
+
+    if (!self->handle)
+    {
+        PyErr_SetString(ALSAAudioError, "PCM device is closed");
+    }
+
+    pfd.fd = i_arg;
+    pfd.events = POLLIN;
+    status_code = snd_pcm_poll_descriptors_revents(
+            self->handle, &pfd, 1, &revents);
+    if (status_code < 0)
+    {
+        PyErr_Format(ALSAAudioError, "Can't get poll revents [%s]",
+                     self->cardname);
+        return NULL;
+    }
+
+    if (revents & POLLERR)
+    {
+        PyErr_Format(ALSAAudioError, "Unknown error [%s]",
+                     self->cardname);
+        return NULL;
+    }
+    return Py_BuildValue("i", revents);
+}
+
+PyDoc_STRVAR(pcm_poll_revents_doc,
+"poll_revents() -> Which descriptors are really ready.");
 
 /* ALSA PCM Object Bureaucracy */
 
@@ -948,6 +986,8 @@ static PyMethodDef alsapcm_methods[] = {
     {"close", (PyCFunction)alsapcm_close, METH_VARARGS, pcm_close_doc},
     {"polldescriptors", (PyCFunction)alsapcm_polldescriptors, METH_VARARGS,
      pcm_polldescriptors_doc},
+    {"poll_revents", (PyCFunction)alsapcm_poll_revents, METH_VARARGS,
+     pcm_poll_revents_doc},
     {NULL, NULL}
 };
 
@@ -2090,6 +2130,7 @@ alsamixer_polldescriptors(alsamixer_t *self, PyObject *args)
     {
         PyErr_Format(PyExc_MemoryError, "Out of memory [%s]",
                      self->cardname);
+        free(fds);
         return NULL;
     }
 
@@ -2099,6 +2140,7 @@ alsamixer_polldescriptors(alsamixer_t *self, PyObject *args)
     {
         PyErr_Format(ALSAAudioError, "Can't get poll descriptors [%s]",
                      self->cardname);
+        free(fds);
         return NULL;
     }
 
@@ -2108,6 +2150,7 @@ alsamixer_polldescriptors(alsamixer_t *self, PyObject *args)
                        Py_BuildValue("II", fds[i].fd, fds[i].events));
     }
 
+    free(fds);
     return result;
 }
 
