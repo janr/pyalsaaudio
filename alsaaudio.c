@@ -908,6 +908,7 @@ alsapcm_polldescriptors(alsapcm_t *self, PyObject *args)
     {
         PyErr_Format(ALSAAudioError, "Can't get poll descriptors [%s]",
                      self->cardname);
+        free(fds);
         return NULL;
     }
 
@@ -917,6 +918,7 @@ alsapcm_polldescriptors(alsapcm_t *self, PyObject *args)
                        Py_BuildValue("II", fds[i].fd, fds[i].events));
     }
 
+    free(fds);
     return result;
 }
 
