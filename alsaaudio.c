@@ -46,7 +46,7 @@ typedef struct {
     int format;
     snd_pcm_uframes_t periodsize;
     int framesize;
-
+    snd_pcm_uframes_t buffersize;
 } alsapcm_t;
 
 typedef struct {
@@ -249,9 +249,11 @@ static int alsapcm_setup(alsapcm_t *self)
     snd_pcm_hw_params_set_format(self->handle, hwparams, self->format);
     snd_pcm_hw_params_set_channels(self->handle, hwparams,
                                    self->channels);
+    snd_pcm_hw_params_set_rate_resample(self->handle, hwparams, 1);
 
     dir = 0;
     snd_pcm_hw_params_set_rate(self->handle, hwparams, self->rate, dir);
+    snd_pcm_hw_params_set_buffer_size(self->handle, hwparams, self->buffersize);
     snd_pcm_hw_params_set_period_size(self->handle, hwparams,
                                       self->periodsize, dir);
     snd_pcm_hw_params_set_periods(self->handle, hwparams, 4, 0);
@@ -268,6 +270,8 @@ static int alsapcm_setup(alsapcm_t *self)
     snd_pcm_hw_params_get_rate(hwparams, &val, &dir); self->rate = val;
     snd_pcm_hw_params_get_period_size(hwparams, &frames, &dir);
     self->periodsize = (int) frames;
+    snd_pcm_hw_params_get_buffer_size(hwparams, &frames);
+    self->buffersize = (int) frames;
 
     self->framesize = self->channels * snd_pcm_hw_params_get_sbits(hwparams)/8;
 
@@ -338,6 +342,7 @@ alsapcm_new(PyTypeObject *type, PyObject *args, PyObject *kwds)
     self->rate = 44100;
     self->format = SND_PCM_FORMAT_S16_LE;
     self->periodsize = 32;
+    self->buffersize = 256;
 
     res = snd_pcm_open(&(self->handle), device, self->pcmtype,
                        self->pcmmode);
@@ -345,7 +350,7 @@ alsapcm_new(PyTypeObject *type, PyObject *args, PyObject *kwds)
     if (res >= 0) {
         res = alsapcm_setup(self);
     }
-    
+
     if (res >= 0) {
         self->cardname = strdup(device);
     }
@@ -426,6 +431,7 @@ alsapcm_dumpinfo(alsapcm_t *self, PyObject *args)
     printf("format = '%s' (%s)\n",
            snd_pcm_format_name(fmt),
            snd_pcm_format_description(fmt));
+    printf("frame size = '%d'\n", self->framesize);
 
     snd_pcm_hw_params_get_subformat(hwparams, (snd_pcm_subformat_t *)&val);
     printf("subformat = '%s' (%s)\n",
@@ -688,6 +694,41 @@ frames (unless the device is in PCM_NONBLOCK mode, in which case it\n\
 may return nothing at all).");
 
 static PyObject *
+alsapcm_setbuffersize(alsapcm_t *self, PyObject *args)
+{
+    int buffersize;
+    int res;
+
+    if (!PyArg_ParseTuple(args,"i:setbuffersize", &buffersize))
+        return NULL;
+
+    if (!self->handle)
+    {
+        PyErr_SetString(ALSAAudioError, "PCM device is closed");
+        return NULL;
+    }
+
+    self->buffersize = buffersize;
+    res = alsapcm_setup(self);
+    if (res < 0)
+    {
+        PyErr_Format(ALSAAudioError, "%s [%s]", snd_strerror(res),
+                     self->cardname);
+
+        return NULL;
+    }
+    return PyLong_FromLong(self->buffersize);
+}
+
+PyDoc_STRVAR(setbuffersize_doc,
+"setbuffersize(period) -> int\n\
+\n\
+Sets the actual period size in frames. Each write should consist of\n\
+exactly this number of frames, and each read will return this number of\n\
+frames (unless the device is in PCM_NONBLOCK mode, in which case it\n\
+may return nothing at all).");
+
+static PyObject *
 alsapcm_read(alsapcm_t *self, PyObject *args)
 {
     int res;
@@ -720,6 +761,7 @@ alsapcm_read(alsapcm_t *self, PyObject *args)
     if (res == -EPIPE)
     {
         /* EPIPE means overrun */
+        printf("EPIPE mean overrun\n");
         snd_pcm_prepare(self->handle);
     }
     Py_END_ALLOW_THREADS
@@ -932,11 +974,12 @@ suitable for use with poll.");
 static PyObject *
 alsapcm_poll_revents(alsapcm_t *self, PyObject *args)
 {
-    int i_arg = 0, status_code;
-    unsigned short revents;
+    int fd = 0, events = 0, status_code;
+    unsigned short revents = 0;
     struct pollfd pfd;
+    int count = 1;
 
-    if (!PyArg_ParseTuple(args, "i:poll_events", &i_arg))
+    if (!PyArg_ParseTuple(args, "iiH:poll_revents", &fd, &events, &revents))
         return NULL;
 
     if (!self->handle)
@@ -944,10 +987,12 @@ alsapcm_poll_revents(alsapcm_t *self, PyObject *args)
         PyErr_SetString(ALSAAudioError, "PCM device is closed");
     }
 
-    pfd.fd = i_arg;
-    pfd.events = POLLIN;
+    pfd.fd = fd;
+    pfd.events = events;
+    pfd.revents = revents;
+
     status_code = snd_pcm_poll_descriptors_revents(
-            self->handle, &pfd, 1, &revents);
+            self->handle, &pfd, count, &revents);
     if (status_code < 0)
     {
         PyErr_Format(ALSAAudioError, "Can't get poll revents [%s]",
@@ -967,6 +1012,110 @@ alsapcm_poll_revents(alsapcm_t *self, PyObject *args)
 PyDoc_STRVAR(pcm_poll_revents_doc,
 "poll_revents() -> Which descriptors are really ready.");
 
+
+/*
+ *   Underrun and suspend recovery
+ */
+
+static int xrun_recovery(snd_pcm_t *handle, int err)
+{
+    if (err == -EPIPE) {    /* under-run */
+            Py_BEGIN_ALLOW_THREADS
+            err = snd_pcm_prepare(handle);
+            Py_END_ALLOW_THREADS
+            if (err < 0)
+                    printf("Can't recovery from underrun, prepare failed: %s\n", snd_strerror(err));
+
+            return 0;
+    } else if (err == -ESTRPIPE) {
+            while ((err = snd_pcm_resume(handle)) == -EAGAIN)
+                    sleep(1);       /* wait until the suspend flag is released */
+            if (err < 0) {
+                    Py_BEGIN_ALLOW_THREADS
+                    err = snd_pcm_prepare(handle);
+                    Py_END_ALLOW_THREADS
+                    if (err < 0)
+                            printf("Can't recovery from suspend, prepare failed: %s\n", snd_strerror(err));
+            }
+            return 0;
+    }
+    return err;
+}
+
+static PyObject *
+alsapcm_pollerr_recover(alsapcm_t *self, PyObject *args)
+{
+    int err;
+
+    if (!PyArg_ParseTuple(args, ":pollerr_recover"))
+        return NULL;
+
+    if (!self->handle)
+    {
+        PyErr_SetString(ALSAAudioError, "PCM device is closed");
+    }
+
+    if (snd_pcm_state(self->handle) == SND_PCM_STATE_XRUN ||
+            snd_pcm_state(self->handle) == SND_PCM_STATE_SUSPENDED) {
+        err = snd_pcm_state(self->handle) == SND_PCM_STATE_XRUN ? -EPIPE: -ESTRPIPE;
+
+        if (xrun_recovery(self->handle, err) < 0) {
+            PyErr_Format(ALSAAudioError, "Write error [%s]",
+                         snd_strerror(err));
+            return NULL;
+        }
+    } else {
+        PyErr_Format(ALSAAudioError, "Wait for poll failed [%d]", snd_pcm_state(self->handle));
+        return NULL;
+    }
+
+    return Py_BuildValue("i", 0);
+}
+
+PyDoc_STRVAR(pcm_pollerr_recover_doc,
+"pollerr_recover() -> attempt to recover from a POLLERR.");
+
+static PyObject *
+alsapcm_print_state(alsapcm_t *self, PyObject *args)
+{
+    if (!PyArg_ParseTuple(args, ":print_state"))
+        return NULL;
+    printf("PCM state = %s\n",
+           snd_pcm_state_name(snd_pcm_state(self->handle)));
+
+    Py_INCREF(Py_None);
+    return Py_None;
+}
+
+PyDoc_STRVAR(pcm_print_state_doc,
+"print_state() -> Print the state string.");
+
+static PyObject *
+alsapcm_pcm_state(alsapcm_t *self, PyObject *args)
+{
+    int state = 0;
+    if (!PyArg_ParseTuple(args, ":pcm_state"))
+        return NULL;
+    state = snd_pcm_state(self->handle);
+
+    return Py_BuildValue("i", state);
+}
+
+PyDoc_STRVAR(pcm_pcm_state_doc,
+"pcm_state() -> Get the pcm state.");
+
+static PyObject *
+alsapcm_pcm_get_framesize(alsapcm_t *self, PyObject *args)
+{
+    if (!PyArg_ParseTuple(args, ":get_framesize"))
+        return NULL;
+    return Py_BuildValue("i", self->framesize);
+}
+
+PyDoc_STRVAR(pcm_get_framesize_doc,
+"get_framesize() -> Get the framesize.");
+
+
 /* ALSA PCM Object Bureaucracy */
 
 static PyMethodDef alsapcm_methods[] = {
@@ -979,6 +1128,8 @@ static PyMethodDef alsapcm_methods[] = {
     {"setformat", (PyCFunction)alsapcm_setformat, METH_VARARGS, setformat_doc},
     {"setperiodsize", (PyCFunction)alsapcm_setperiodsize, METH_VARARGS,
      setperiodsize_doc},
+    {"setbuffersize", (PyCFunction)alsapcm_setbuffersize, METH_VARARGS,
+     setbuffersize_doc},
     {"dumpinfo", (PyCFunction)alsapcm_dumpinfo, METH_VARARGS},
     {"read", (PyCFunction)alsapcm_read, METH_VARARGS, read_doc},
     {"write", (PyCFunction)alsapcm_write, METH_VARARGS, write_doc},
@@ -988,6 +1139,14 @@ static PyMethodDef alsapcm_methods[] = {
      pcm_polldescriptors_doc},
     {"poll_revents", (PyCFunction)alsapcm_poll_revents, METH_VARARGS,
      pcm_poll_revents_doc},
+    {"pollerr_recover", (PyCFunction)alsapcm_pollerr_recover, METH_VARARGS,
+     pcm_pollerr_recover_doc},
+    {"print_state", (PyCFunction)alsapcm_print_state, METH_VARARGS,
+     pcm_print_state_doc},
+    {"pcm_state", (PyCFunction)alsapcm_pcm_state, METH_VARARGS,
+     pcm_pcm_state_doc},
+    {"get_framesize", (PyCFunction)alsapcm_pcm_get_framesize, METH_VARARGS,
+     pcm_get_framesize_doc},
     {NULL, NULL}
 };
 
@@ -2327,6 +2486,16 @@ PyObject *PyInit_alsaaudio(void)
     _EXPORT_INT(m, "PCM_NORMAL",0);
     _EXPORT_INT(m, "PCM_NONBLOCK",SND_PCM_NONBLOCK);
     _EXPORT_INT(m, "PCM_ASYNC",SND_PCM_ASYNC);
+
+    _EXPORT_INT(m, "PCM_STATE_OPEN", SND_PCM_STATE_OPEN);
+    _EXPORT_INT(m, "PCM_STATE_SETUP", SND_PCM_STATE_SETUP);
+    _EXPORT_INT(m, "PCM_STATE_PREPARED", SND_PCM_STATE_PREPARED);
+    _EXPORT_INT(m, "PCM_STATE_RUNNING", SND_PCM_STATE_RUNNING);
+    _EXPORT_INT(m, "PCM_STATE_XRUN", SND_PCM_STATE_XRUN);
+    _EXPORT_INT(m, "PCM_STATE_DRAINING", SND_PCM_STATE_DRAINING);
+    _EXPORT_INT(m, "PCM_STATE_PAUSED", SND_PCM_STATE_PAUSED);
+    _EXPORT_INT(m, "PCM_STATE_SUSPENDED", SND_PCM_STATE_SUSPENDED);
+    _EXPORT_INT(m, "PCM_STATE_DISCONNECTED", SND_PCM_STATE_DISCONNECTED);
 
     /* PCM Formats */
     _EXPORT_INT(m, "PCM_FORMAT_S8",SND_PCM_FORMAT_S8);
